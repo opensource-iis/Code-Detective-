@@ -1,12 +1,20 @@
 /**
- * The Code Detective room server. One PartyKit room = one game session.
- * Single source of truth for all game state — see ARCHITECTURE.md.
+ * The Code Detective room server. One Durable Object room = one game
+ * session; single source of truth for all game state — see
+ * ARCHITECTURE.md. Built on partyserver (Cloudflare's successor to the
+ * hosted PartyKit platform); the partysocket client is unchanged.
  *
- * NOTE: imports are relative (not @/ aliases) because PartyKit's esbuild
- * does not resolve tsconfig path aliases.
+ * NOTE: imports are relative (not @/ aliases) because the worker
+ * bundler does not resolve tsconfig path aliases.
  */
 
-import type * as Party from "partykit/server";
+import {
+  routePartykitRequest,
+  Server,
+  type Connection,
+  type ConnectionContext,
+  type WSMessage,
+} from "partyserver";
 
 import { matchesAccepted, normalizeFix } from "../src/game/answers";
 import { casesForTier, getCase, validateBank } from "../src/game/cases";
@@ -93,15 +101,13 @@ class GameError extends Error {
 
 const TIERS: Tier[] = ["rookie", "detective", "inspector"];
 
-export default class CodeDetectiveServer implements Party.Server {
+export class CodeDetective extends Server {
   private state: RoomState | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private conns = new Map<string, ConnMeta>();
 
-  constructor(readonly room: Party.Room) {}
-
   async onStart(): Promise<void> {
-    const stored = await this.room.storage.get<RoomState>("state");
+    const stored = await this.ctx.storage.get<RoomState>("state");
     if (!stored) return;
     this.state = stored;
     // Connections never survive a restart; presence is rebuilt on connect.
@@ -112,8 +118,8 @@ export default class CodeDetectiveServer implements Party.Server {
   }
 
   async onConnect(
-    conn: Party.Connection,
-    ctx: Party.ConnectionContext,
+    conn: Connection,
+    ctx: ConnectionContext,
   ): Promise<void> {
     const url = new URL(ctx.request.url);
     const role = url.searchParams.get("role");
@@ -159,7 +165,12 @@ export default class CodeDetectiveServer implements Party.Server {
     this.conns.set(conn.id, { role: "pending" });
   }
 
-  async onClose(conn: Party.Connection): Promise<void> {
+  async onClose(
+    conn: Connection,
+    _code: number,
+    _reason: string,
+    _wasClean: boolean,
+  ): Promise<void> {
     const meta = this.conns.get(conn.id);
     this.conns.delete(conn.id);
     if (!meta || !this.state) return;
@@ -185,9 +196,12 @@ export default class CodeDetectiveServer implements Party.Server {
     }
   }
 
-  async onMessage(raw: string, sender: Party.Connection): Promise<void> {
+  async onMessage(sender: Connection, raw: WSMessage): Promise<void> {
     let message: ClientMessage;
     try {
+      if (typeof raw !== "string") {
+        throw new Error("Binary messages are not part of the protocol");
+      }
       message = parseClientMessage(raw);
     } catch {
       this.send(sender, {
@@ -247,7 +261,7 @@ export default class CodeDetectiveServer implements Party.Server {
   // ----------------------------------------------------------------
 
   private async handleHostInit(
-    conn: Party.Connection,
+    conn: Connection,
     hostKey: string,
     config: RoomConfig,
   ): Promise<void> {
@@ -299,7 +313,7 @@ export default class CodeDetectiveServer implements Party.Server {
     await this.mutated();
   }
 
-  private async handleHostAdvance(conn: Party.Connection): Promise<void> {
+  private async handleHostAdvance(conn: Connection): Promise<void> {
     this.requireHost(conn);
     const state = this.requireState();
 
@@ -339,7 +353,7 @@ export default class CodeDetectiveServer implements Party.Server {
   }
 
   private async handleHostKick(
-    conn: Party.Connection,
+    conn: Connection,
     playerId: string,
   ): Promise<void> {
     this.requireHost(conn);
@@ -351,7 +365,7 @@ export default class CodeDetectiveServer implements Party.Server {
       throw new GameError("NOT_A_PLAYER", "No such detective.");
     }
     delete state.players[playerId];
-    for (const c of this.room.getConnections()) {
+    for (const c of this.getConnections()) {
       const meta = this.conns.get(c.id);
       if (meta?.role === "player" && meta.playerId === playerId) {
         this.send(c, { type: "kicked" });
@@ -361,7 +375,7 @@ export default class CodeDetectiveServer implements Party.Server {
     await this.mutated();
   }
 
-  private async handleJoin(conn: Party.Connection, name: string): Promise<void> {
+  private async handleJoin(conn: Connection, name: string): Promise<void> {
     const state = this.state;
     if (!state) {
       throw new GameError(
@@ -432,7 +446,7 @@ export default class CodeDetectiveServer implements Party.Server {
     await this.mutated();
   }
 
-  private async handleReady(conn: Party.Connection): Promise<void> {
+  private async handleReady(conn: Connection): Promise<void> {
     const state = this.requireState();
     const player = this.requirePlayer(conn);
     if (state.phase !== "evidence" || this.isPaused()) {
@@ -445,7 +459,7 @@ export default class CodeDetectiveServer implements Party.Server {
   }
 
   private async handleSubmit(
-    conn: Party.Connection,
+    conn: Connection,
     answer: SubmittedAnswer,
   ): Promise<void> {
     const state = this.requireState();
@@ -748,7 +762,7 @@ export default class CodeDetectiveServer implements Party.Server {
   }
 
   /** Restore a reconnecting player's round mid-INVESTIGATION. */
-  private sendResume(conn: Party.Connection, player: PlayerInternal): void {
+  private sendResume(conn: Connection, player: PlayerInternal): void {
     const state = this.state;
     if (!state || state.phase !== "investigation") return;
     if (player.spectator || player.resolved || player.attemptsUsed === 0) {
@@ -895,7 +909,7 @@ export default class CodeDetectiveServer implements Party.Server {
     return this.state;
   }
 
-  private requireHost(conn: Party.Connection): void {
+  private requireHost(conn: Connection): void {
     if (this.conns.get(conn.id)?.role !== "host") {
       throw new GameError(
         "NOT_THE_HOST",
@@ -904,7 +918,7 @@ export default class CodeDetectiveServer implements Party.Server {
     }
   }
 
-  private requirePlayer(conn: Party.Connection): PlayerInternal {
+  private requirePlayer(conn: Connection): PlayerInternal {
     const state = this.requireState();
     const meta = this.conns.get(conn.id);
     if (!meta || meta.role !== "player") {
@@ -917,11 +931,11 @@ export default class CodeDetectiveServer implements Party.Server {
     return player;
   }
 
-  private send(conn: Party.Connection, message: ServerMessage): void {
+  private send(conn: Connection, message: ServerMessage): void {
     conn.send(JSON.stringify(message));
   }
 
-  private sendState(conn: Party.Connection): void {
+  private sendState(conn: Connection): void {
     if (!this.state) return;
     this.send(conn, { type: "state", state: this.toPublicState() });
   }
@@ -929,11 +943,22 @@ export default class CodeDetectiveServer implements Party.Server {
   /** Persist + broadcast after every mutation. */
   private async mutated(): Promise<void> {
     if (!this.state) return;
-    await this.room.storage.put("state", this.state);
-    this.room.broadcast(
+    await this.ctx.storage.put("state", this.state);
+    this.broadcast(
       JSON.stringify({ type: "state", state: this.toPublicState() }),
     );
   }
 }
 
-CodeDetectiveServer satisfies Party.Worker;
+interface Env {
+  CodeDetective: DurableObjectNamespace;
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    return (
+      (await routePartykitRequest(request, env)) ??
+      new Response("No such party here.", { status: 404 })
+    );
+  },
+};

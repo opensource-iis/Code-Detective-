@@ -21,7 +21,7 @@ import type {
   Tier,
 } from "@/game/protocol";
 import { getOrCreateHostKey, randomRoomCode } from "@/lib/identity";
-import { PARTYKIT_HOST } from "@/lib/party";
+import { PARTY_NAME, PARTYKIT_HOST } from "@/lib/party";
 
 export default function HostPage({
   params,
@@ -75,6 +75,7 @@ function HostClient({ room, hostKey }: { room: string; hostKey: string }) {
 
   const socket = usePartySocket({
     host: PARTYKIT_HOST,
+    party: PARTY_NAME,
     room,
     query,
     onOpen() {

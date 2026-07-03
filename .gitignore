@@ -11,3 +11,6 @@ CLAUDE.md
 GAME.md
 DESIGN.md
 ARCHITECTURE.md
+
+# wrangler local state
+.wrangler/

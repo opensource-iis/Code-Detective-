@@ -24,7 +24,7 @@ import type {
   ServerMessage,
 } from "@/game/protocol";
 import { getOrCreateBadge, recallName, rememberName } from "@/lib/identity";
-import { PARTYKIT_HOST } from "@/lib/party";
+import { PARTY_NAME, PARTYKIT_HOST } from "@/lib/party";
 
 export default function PlayPage({
   params,
@@ -59,6 +59,7 @@ function PlayerClient({ room, badge }: { room: string; badge: string }) {
 
   const socket = usePartySocket({
     host: PARTYKIT_HOST,
+    party: PARTY_NAME,
     room,
     query,
     onOpen() {

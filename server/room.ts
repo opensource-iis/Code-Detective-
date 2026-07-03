@@ -1,20 +1,12 @@
 /**
- * The Code Detective room server. One Durable Object room = one game
- * session; single source of truth for all game state — see
- * ARCHITECTURE.md. Built on partyserver (Cloudflare's successor to the
- * hosted PartyKit platform); the partysocket client is unchanged.
+ * The Code Detective game room — one instance per live session, held in
+ * memory by the Node wire server (see server/index.ts). Single source
+ * of truth for all game state; clients only ever render it.
  *
- * NOTE: imports are relative (not @/ aliases) because the worker
- * bundler does not resolve tsconfig path aliases.
+ * Rooms live for one game night (GAME.md scopes out cross-session
+ * persistence), so state is in-memory: a server restart simply means
+ * the Chief Inspector opens a fresh case file.
  */
-
-import {
-  routePartykitRequest,
-  Server,
-  type Connection,
-  type ConnectionContext,
-  type WSMessage,
-} from "partyserver";
 
 import { matchesAccepted, normalizeFix } from "../src/game/answers";
 import { casesForTier, getCase, validateBank } from "../src/game/cases";
@@ -46,6 +38,13 @@ import type {
 } from "../src/game/protocol";
 import { scoreForSolve } from "../src/game/scoring";
 import { BRIEFING_MS, SUSPENSE_MS, TIER_TIMING } from "../src/game/timing";
+
+/** What the wire server hands the room for each socket. */
+export interface WireConnection {
+  id: string;
+  send(data: string): void;
+  close(): void;
+}
 
 interface PlayerInternal {
   id: string;
@@ -101,27 +100,23 @@ class GameError extends Error {
 
 const TIERS: Tier[] = ["rookie", "detective", "inspector"];
 
-export class CodeDetective extends Server {
+export class GameRoom {
   private state: RoomState | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private conns = new Map<string, ConnMeta>();
+  private sockets = new Set<WireConnection>();
 
-  async onStart(): Promise<void> {
-    const stored = await this.ctx.storage.get<RoomState>("state");
-    if (!stored) return;
-    this.state = stored;
-    // Connections never survive a restart; presence is rebuilt on connect.
-    for (const p of Object.values(this.state.players)) p.connected = false;
-    if (this.state.phaseEndsAt !== null) {
-      this.armTimer(Math.max(0, this.state.phaseEndsAt - Date.now()));
-    }
+  /** True when the room holds neither connections nor a started game. */
+  get isIdle(): boolean {
+    return this.sockets.size === 0;
   }
 
-  async onConnect(
-    conn: Connection,
-    ctx: ConnectionContext,
-  ): Promise<void> {
-    const url = new URL(ctx.request.url);
+  dispose(): void {
+    this.clearTimer();
+  }
+
+  onConnect(conn: WireConnection, url: URL): void {
+    this.sockets.add(conn);
     const role = url.searchParams.get("role");
     const hostKey = url.searchParams.get("hostKey");
     const badge = url.searchParams.get("badge");
@@ -129,7 +124,7 @@ export class CodeDetective extends Server {
     if (role === "host") {
       if (this.state && hostKey === this.state.hostKey) {
         this.conns.set(conn.id, { role: "host" });
-        await this.onHostPresent();
+        this.onHostPresent();
         this.sendState(conn);
       } else {
         // Either the room doesn't exist yet (host:init will create it) or
@@ -154,7 +149,7 @@ export class CodeDetective extends Server {
         player.connected = true;
         this.send(conn, { type: "joined", playerId: badge, name: player.name });
       }
-      await this.mutated();
+      this.mutated();
       // Resume AFTER the state broadcast: the client resets its per-case
       // local state when a new case id arrives, which would wipe a resume
       // delivered first.
@@ -165,18 +160,14 @@ export class CodeDetective extends Server {
     this.conns.set(conn.id, { role: "pending" });
   }
 
-  async onClose(
-    conn: Connection,
-    _code: number,
-    _reason: string,
-    _wasClean: boolean,
-  ): Promise<void> {
+  onClose(conn: WireConnection): void {
+    this.sockets.delete(conn);
     const meta = this.conns.get(conn.id);
     this.conns.delete(conn.id);
     if (!meta || !this.state) return;
 
     if (meta.role === "host") {
-      if (!this.hostConnected()) await this.onHostAbsent();
+      if (!this.hostConnected()) this.onHostAbsent();
       return;
     }
     if (meta.role === "player") {
@@ -191,17 +182,14 @@ export class CodeDetective extends Server {
         if (this.state.phase === "investigation") {
           this.checkInvestigationEarlyEnd();
         }
-        await this.mutated();
+        this.mutated();
       }
     }
   }
 
-  async onMessage(sender: Connection, raw: WSMessage): Promise<void> {
+  onMessage(sender: WireConnection, raw: string): void {
     let message: ClientMessage;
     try {
-      if (typeof raw !== "string") {
-        throw new Error("Binary messages are not part of the protocol");
-      }
       message = parseClientMessage(raw);
     } catch {
       this.send(sender, {
@@ -215,22 +203,22 @@ export class CodeDetective extends Server {
     try {
       switch (message.type) {
         case "host:init":
-          await this.handleHostInit(sender, message.hostKey, message.config);
+          this.handleHostInit(sender, message.hostKey, message.config);
           break;
         case "host:advance":
-          await this.handleHostAdvance(sender);
+          this.handleHostAdvance(sender);
           break;
         case "host:kick":
-          await this.handleHostKick(sender, message.playerId);
+          this.handleHostKick(sender, message.playerId);
           break;
         case "join":
-          await this.handleJoin(sender, message.name);
+          this.handleJoin(sender, message.name);
           break;
         case "ready":
-          await this.handleReady(sender);
+          this.handleReady(sender);
           break;
         case "submit":
-          await this.handleSubmit(sender, message.answer);
+          this.handleSubmit(sender, message.answer);
           break;
         default: {
           const exhaustive: never = message;
@@ -260,11 +248,11 @@ export class CodeDetective extends Server {
   // Message handlers
   // ----------------------------------------------------------------
 
-  private async handleHostInit(
-    conn: Connection,
+  private handleHostInit(
+    conn: WireConnection,
     hostKey: string,
     config: RoomConfig,
-  ): Promise<void> {
+  ): void {
     if (this.state) {
       if (this.state.hostKey !== hostKey) {
         throw new GameError(
@@ -274,7 +262,7 @@ export class CodeDetective extends Server {
       }
       // Idempotent resume.
       this.conns.set(conn.id, { role: "host" });
-      await this.onHostPresent();
+      this.onHostPresent();
       this.sendState(conn);
       return;
     }
@@ -310,10 +298,10 @@ export class CodeDetective extends Server {
       pausedRemainingMs: null,
     };
     this.conns.set(conn.id, { role: "host" });
-    await this.mutated();
+    this.mutated();
   }
 
-  private async handleHostAdvance(conn: Connection): Promise<void> {
+  private handleHostAdvance(conn: WireConnection): void {
     this.requireHost(conn);
     const state = this.requireState();
 
@@ -328,18 +316,18 @@ export class CodeDetective extends Server {
             "No detectives on the force yet — wait for at least one to join.",
           );
         }
-        await this.startCase(0);
+        this.startCase(0);
         break;
       }
       case "reveal":
         state.phase = "docket";
-        await this.mutated();
+        this.mutated();
         break;
       case "docket":
         if (state.caseIndex + 1 < state.caseIds.length) {
-          await this.startCase(state.caseIndex + 1);
+          this.startCase(state.caseIndex + 1);
         } else {
-          await this.finalize();
+          this.finalize();
         }
         break;
       default:
@@ -352,30 +340,30 @@ export class CodeDetective extends Server {
     }
   }
 
-  private async handleHostKick(
-    conn: Connection,
-    playerId: string,
-  ): Promise<void> {
+  private handleHostKick(conn: WireConnection, playerId: string): void {
     this.requireHost(conn);
     const state = this.requireState();
     if (state.phase !== "lobby") {
-      throw new GameError("BAD_PHASE", "Detectives can only be dismissed in the lobby.");
+      throw new GameError(
+        "BAD_PHASE",
+        "Detectives can only be dismissed in the lobby.",
+      );
     }
     if (!state.players[playerId]) {
       throw new GameError("NOT_A_PLAYER", "No such detective.");
     }
     delete state.players[playerId];
-    for (const c of this.getConnections()) {
-      const meta = this.conns.get(c.id);
+    for (const socket of this.sockets) {
+      const meta = this.conns.get(socket.id);
       if (meta?.role === "player" && meta.playerId === playerId) {
-        this.send(c, { type: "kicked" });
-        c.close();
+        this.send(socket, { type: "kicked" });
+        socket.close();
       }
     }
-    await this.mutated();
+    this.mutated();
   }
 
-  private async handleJoin(conn: Connection, name: string): Promise<void> {
+  private handleJoin(conn: WireConnection, name: string): void {
     const state = this.state;
     if (!state) {
       throw new GameError(
@@ -385,7 +373,10 @@ export class CodeDetective extends Server {
     }
     const meta = this.conns.get(conn.id);
     if (!meta || meta.role !== "player") {
-      throw new GameError("NOT_A_PLAYER", "Connect with a detective badge to join.");
+      throw new GameError(
+        "NOT_A_PLAYER",
+        "Connect with a detective badge to join.",
+      );
     }
 
     const existing = state.players[meta.playerId];
@@ -409,7 +400,7 @@ export class CodeDetective extends Server {
         playerId: existing.id,
         name: existing.name,
       });
-      await this.mutated();
+      this.mutated();
       // After the broadcast — see the ordering note in onConnect.
       this.sendResume(conn, existing);
       return;
@@ -442,33 +433,40 @@ export class CodeDetective extends Server {
       bestSolveCase: null,
       longestStreak: 0,
     };
-    this.send(conn, { type: "joined", playerId: meta.playerId, name: finalName });
-    await this.mutated();
+    this.send(conn, {
+      type: "joined",
+      playerId: meta.playerId,
+      name: finalName,
+    });
+    this.mutated();
   }
 
-  private async handleReady(conn: Connection): Promise<void> {
+  private handleReady(conn: WireConnection): void {
     const state = this.requireState();
     const player = this.requirePlayer(conn);
     if (state.phase !== "evidence" || this.isPaused()) {
-      throw new GameError("BAD_PHASE", "There is nothing to be ready for right now.");
+      throw new GameError(
+        "BAD_PHASE",
+        "There is nothing to be ready for right now.",
+      );
     }
     if (player.spectator || player.ready) return;
     player.ready = true;
     this.checkEvidenceEarlyEnd();
-    await this.mutated();
+    this.mutated();
   }
 
-  private async handleSubmit(
-    conn: Connection,
-    answer: SubmittedAnswer,
-  ): Promise<void> {
+  private handleSubmit(conn: WireConnection, answer: SubmittedAnswer): void {
     const state = this.requireState();
     const player = this.requirePlayer(conn);
     if (state.phase !== "investigation" || this.isPaused()) {
       throw new GameError("BAD_PHASE", "Submissions are locked right now.");
     }
     if (player.spectator) {
-      throw new GameError("BAD_PHASE", "You joined mid-case — you play from the next one.");
+      throw new GameError(
+        "BAD_PHASE",
+        "You joined mid-case — you play from the next one.",
+      );
     }
     if (player.resolved || player.attemptsUsed >= MAX_ATTEMPTS) {
       throw new GameError("BAD_PHASE", "This case is already closed for you.");
@@ -495,7 +493,10 @@ export class CodeDetective extends Server {
       }
     } else {
       if (caseFile.format !== "text") {
-        throw new GameError("BAD_MESSAGE", "This case expects an exhibit choice.");
+        throw new GameError(
+          "BAD_MESSAGE",
+          "This case expects an exhibit choice.",
+        );
       }
       if (normalizeFix(answer.text).length === 0) {
         throw new GameError("BAD_MESSAGE", "An empty fix isn't a theory.");
@@ -553,14 +554,14 @@ export class CodeDetective extends Server {
       hint,
     });
     this.checkInvestigationEarlyEnd();
-    await this.mutated();
+    this.mutated();
   }
 
   // ----------------------------------------------------------------
   // Phase machine
   // ----------------------------------------------------------------
 
-  private async startCase(index: number): Promise<void> {
+  private startCase(index: number): void {
     const state = this.requireState();
     state.caseIndex = index;
     state.histogram = [0, 0, 0, 0];
@@ -575,7 +576,7 @@ export class CodeDetective extends Server {
       p.spectator = false; // late joiners are promoted at the next briefing
     }
     this.enterTimedPhase("briefing", BRIEFING_MS);
-    await this.mutated();
+    this.mutated();
   }
 
   private enterTimedPhase(phase: Phase, durationMs: number): void {
@@ -590,7 +591,7 @@ export class CodeDetective extends Server {
   private armTimer(delayMs: number): void {
     this.clearTimer();
     this.timer = setTimeout(() => {
-      void this.onPhaseTimeout();
+      this.onPhaseTimeout();
     }, delayMs);
   }
 
@@ -601,7 +602,7 @@ export class CodeDetective extends Server {
     }
   }
 
-  private async onPhaseTimeout(): Promise<void> {
+  private onPhaseTimeout(): void {
     const state = this.state;
     if (!state || this.isPaused()) return;
     switch (state.phase) {
@@ -629,7 +630,7 @@ export class CodeDetective extends Server {
       default:
         return; // host-paced phases have no timeout
     }
-    await this.mutated();
+    this.mutated();
   }
 
   private checkEvidenceEarlyEnd(): void {
@@ -668,13 +669,13 @@ export class CodeDetective extends Server {
     this.enterTimedPhase("suspense", SUSPENSE_MS);
   }
 
-  private async finalize(): Promise<void> {
+  private finalize(): void {
     const state = this.requireState();
     state.phase = "final";
     state.phaseEndsAt = null;
     state.phaseDurationMs = null;
     this.clearTimer();
-    await this.mutated();
+    this.mutated();
   }
 
   // ----------------------------------------------------------------
@@ -682,15 +683,17 @@ export class CodeDetective extends Server {
   // ----------------------------------------------------------------
 
   private isPaused(): boolean {
-    return this.state?.pausedRemainingMs !== null &&
-      this.state?.pausedRemainingMs !== undefined;
+    return (
+      this.state?.pausedRemainingMs !== null &&
+      this.state?.pausedRemainingMs !== undefined
+    );
   }
 
   private hostConnected(): boolean {
     return [...this.conns.values()].some((m) => m.role === "host");
   }
 
-  private async onHostAbsent(): Promise<void> {
+  private onHostAbsent(): void {
     const state = this.state;
     if (!state) return;
     if (state.phaseEndsAt !== null) {
@@ -700,10 +703,10 @@ export class CodeDetective extends Server {
     } else if (state.phase !== "lobby" && state.phase !== "final") {
       state.pausedRemainingMs = 0; // paused in a host-paced phase
     }
-    await this.mutated();
+    this.mutated();
   }
 
-  private async onHostPresent(): Promise<void> {
+  private onHostPresent(): void {
     const state = this.state;
     if (!state || !this.isPaused()) return;
     const remaining = state.pausedRemainingMs!;
@@ -718,7 +721,7 @@ export class CodeDetective extends Server {
       state.phaseDurationMs = state.phaseDurationMs ?? remaining;
       this.armTimer(remaining);
     }
-    await this.mutated();
+    this.mutated();
   }
 
   // ----------------------------------------------------------------
@@ -733,8 +736,7 @@ export class CodeDetective extends Server {
   private isDoublePoints(): boolean {
     const state = this.requireState();
     return (
-      state.caseIds.length > 1 &&
-      state.caseIndex === state.caseIds.length - 1
+      state.caseIds.length > 1 && state.caseIndex === state.caseIds.length - 1
     );
   }
 
@@ -762,7 +764,7 @@ export class CodeDetective extends Server {
   }
 
   /** Restore a reconnecting player's round mid-INVESTIGATION. */
-  private sendResume(conn: Connection, player: PlayerInternal): void {
+  private sendResume(conn: WireConnection, player: PlayerInternal): void {
     const state = this.state;
     if (!state || state.phase !== "investigation") return;
     if (player.spectator || player.resolved || player.attemptsUsed === 0) {
@@ -783,8 +785,7 @@ export class CodeDetective extends Server {
 
   private toPublicState(): RoomStatePublic {
     const state = this.requireState();
-    const inRound =
-      state.phase !== "lobby" && state.phase !== "final";
+    const inRound = state.phase !== "lobby" && state.phase !== "final";
     const caseFile = inRound ? this.currentCase() : null;
     const showReveal =
       state.phase === "reveal" ||
@@ -909,7 +910,7 @@ export class CodeDetective extends Server {
     return this.state;
   }
 
-  private requireHost(conn: Connection): void {
+  private requireHost(conn: WireConnection): void {
     if (this.conns.get(conn.id)?.role !== "host") {
       throw new GameError(
         "NOT_THE_HOST",
@@ -918,7 +919,7 @@ export class CodeDetective extends Server {
     }
   }
 
-  private requirePlayer(conn: Connection): PlayerInternal {
+  private requirePlayer(conn: WireConnection): PlayerInternal {
     const state = this.requireState();
     const meta = this.conns.get(conn.id);
     if (!meta || meta.role !== "player") {
@@ -931,34 +932,24 @@ export class CodeDetective extends Server {
     return player;
   }
 
-  private send(conn: Connection, message: ServerMessage): void {
+  private send(conn: WireConnection, message: ServerMessage): void {
     conn.send(JSON.stringify(message));
   }
 
-  private sendState(conn: Connection): void {
+  private sendState(conn: WireConnection): void {
     if (!this.state) return;
     this.send(conn, { type: "state", state: this.toPublicState() });
   }
 
-  /** Persist + broadcast after every mutation. */
-  private async mutated(): Promise<void> {
+  /** Broadcast after every mutation. */
+  private mutated(): void {
     if (!this.state) return;
-    await this.ctx.storage.put("state", this.state);
-    this.broadcast(
-      JSON.stringify({ type: "state", state: this.toPublicState() }),
-    );
+    const json = JSON.stringify({
+      type: "state",
+      state: this.toPublicState(),
+    });
+    for (const socket of this.sockets) {
+      socket.send(json);
+    }
   }
 }
-
-interface Env {
-  CodeDetective: DurableObjectNamespace;
-}
-
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    return (
-      (await routePartykitRequest(request, env)) ??
-      new Response("No such party here.", { status: 404 })
-    );
-  },
-};

@@ -1,0 +1,11 @@
+# Render Blueprint: deploys the realtime wire server straight from the
+# repo (Dashboard -> New -> Blueprint). The Next.js app deploys to
+# Vercel separately; see README.
+services:
+  - type: web
+    name: code-detective
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm run server
+    healthCheckPath: /

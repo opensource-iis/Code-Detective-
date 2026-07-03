@@ -2,7 +2,7 @@
 
 A live, host-led multiplayer debugging party game for grades 6–12, styled as an 1890s crime gazette. The host runs the pace from their own device; every player joins on their own phone or laptop with a 5-digit case number and sees the full case on their own screen — no projector needed. Each round is a **case file**: a real Python snippet with one seeded bug and the *actual* wrong output it produced. Read the evidence, form a theory, submit the fix — three attempts, scored on fewest attempts plus speed.
 
-Built with Next.js 16 (App Router), partyserver on Cloudflare Durable Objects (real-time rooms, partysocket on the client), Tailwind CSS v4, and TypeScript throughout.
+Built with Next.js 16 (App Router), a plain Node WebSocket wire server (`ws` on the server, partysocket on the client), Tailwind CSS v4, and TypeScript throughout.
 
 ## How it works
 
@@ -26,20 +26,17 @@ Open `localhost:3000`, click **Open a Case File** on one screen, then join from 
 
 Both halves deploy straight from this GitHub repo; every push to `main` redeploys both.
 
-1. **Room server → Cloudflare Workers** (free plan works — the Durable Object uses a SQLite-backed class):
-   - [dash.cloudflare.com](https://dash.cloudflare.com) → **Workers & Pages → Create → Workers → Import a repository** → connect GitHub and pick this repo.
-   - Cloudflare reads `wrangler.jsonc`; keep the default deploy command (`npx wrangler deploy`) and deploy.
-   - Copy the worker URL host, e.g. `code-detective.<your-subdomain>.workers.dev`.
+1. **Wire server → Render** (free plan, no card): [dashboard.render.com](https://dashboard.render.com) → **New → Blueprint** → connect GitHub and pick this repo. Render reads `render.yaml` and deploys the Node WebSocket server. Copy the service host, e.g. `code-detective.onrender.com`.
 
 2. **Web app → Vercel:** import this repo at [vercel.com](https://vercel.com) (defaults are fine) and set one environment variable before deploying:
 
    ```text
-   NEXT_PUBLIC_PARTYKIT_HOST=code-detective.<your-subdomain>.workers.dev
+   NEXT_PUBLIC_PARTYKIT_HOST=code-detective.onrender.com
    ```
 
    No protocol prefix, no trailing slash. Locally this defaults to `localhost:1999`.
 
-That's it — the game is live and playable across real phones. (The realtime layer is [partyserver](https://github.com/cloudflare/partykit) on your own Cloudflare account; the hosted partykit.dev platform is at capacity and no longer accepts new deployments.)
+That's it — the game is live and playable across real phones. One free-tier note: Render spins the server down after ~15 idle minutes and takes up to a minute to wake, so open the site a couple of minutes before the room fills up.
 
 ## Scripts
 
@@ -48,7 +45,7 @@ That's it — the game is live and playable across real phones. (The realtime la
 | `npm run dev` / `npm run dev:party` | The two local dev servers (Next on 3000, worker on 1999) |
 | `npm run build` | Production build of the web app |
 | `npm run typecheck` | `tsc --noEmit` over app + server + game modules |
-| `npm run deploy:party` | Deploy the room server to Cloudflare Workers (`wrangler deploy`) |
+| `npm run server` | The wire server as Render runs it (`tsx server/index.ts`) |
 
 ## Adding a case
 

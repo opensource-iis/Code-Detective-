@@ -1,0 +1,9 @@
+node_modules
+.next
+.git
+.vscode
+*.md
+CLAUDE.md
+GAME.md
+DESIGN.md
+ARCHITECTURE.md

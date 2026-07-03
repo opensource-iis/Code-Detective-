@@ -26,17 +26,20 @@ Open `localhost:3000`, click **Open a Case File** on one screen, then join from 
 
 Both halves deploy straight from this GitHub repo; every push to `main` redeploys both.
 
-1. **Wire server → Render** (free plan, no card): [dashboard.render.com](https://dashboard.render.com) → **New → Blueprint** → connect GitHub and pick this repo. Render reads `render.yaml` and deploys the Node WebSocket server. Copy the service host, e.g. `code-detective.onrender.com`.
+1. **Wire server → any free Node host.** The repo carries a `Dockerfile`, so every container platform can run it from a GitHub import; pick whichever works for you:
+   - **Koyeb** (free, no card): [app.koyeb.com](https://app.koyeb.com) → Create Web Service → GitHub → this repo → free instance → deploy. Copy the `*.koyeb.app` host.
+   - **Render** (free, no card): New → Blueprint → this repo (`render.yaml` does the rest). Copy the `*.onrender.com` host.
+   - Railway, Fly, Hugging Face Spaces (Docker), or any VPS: run the container, or `npm install && npm run server`. Copy the public host.
 
 2. **Web app → Vercel:** import this repo at [vercel.com](https://vercel.com) (defaults are fine) and set one environment variable before deploying:
 
    ```text
-   NEXT_PUBLIC_PARTYKIT_HOST=code-detective.onrender.com
+   NEXT_PUBLIC_PARTYKIT_HOST=<your-wire-server-host>
    ```
 
    No protocol prefix, no trailing slash. Locally this defaults to `localhost:1999`.
 
-That's it — the game is live and playable across real phones. One free-tier note: Render spins the server down after ~15 idle minutes and takes up to a minute to wake, so open the site a couple of minutes before the room fills up.
+That's it — the game is live and playable across real phones. One free-tier note: most free instances sleep after ~15 idle minutes and take up to a minute to wake, so open the site a couple of minutes before the room fills up.
 
 ## Scripts
 

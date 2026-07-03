@@ -1,0 +1,13 @@
+node_modules/
+.next/
+.partykit/
+.vercel/
+.env*.local
+*.tsbuildinfo
+next-env.d.ts
+
+# local working documents, not part of the published repo
+CLAUDE.md
+GAME.md
+DESIGN.md
+ARCHITECTURE.md
